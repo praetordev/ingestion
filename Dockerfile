@@ -1,5 +1,5 @@
 # Build Stage
-FROM golang:1.25-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
 
@@ -11,7 +11,7 @@ COPY . .
 RUN go build -o /praetor-ingestion .
 
 # Run Stage
-FROM alpine:3.19
+FROM alpine:3.24
 
 WORKDIR /
 
