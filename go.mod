@@ -8,19 +8,19 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jmoiron/sqlx v1.4.0
 	github.com/lib/pq v1.12.3
-	github.com/praetordev/consumer v0.1.0
+	github.com/praetordev/consumer v0.1.1
 	github.com/praetordev/credentials v0.1.0
 	github.com/praetordev/db v0.1.0
 	github.com/praetordev/env v0.1.0
 	github.com/praetordev/eventbus v0.1.0
 	github.com/praetordev/events v0.1.0
-	github.com/praetordev/metrics v0.1.0
+	github.com/praetordev/metrics v0.1.1
 	github.com/praetordev/models v0.2.0
-	github.com/praetordev/objectstore v0.1.1
+	github.com/praetordev/objectstore v0.1.2
 	github.com/praetordev/plog v0.1.0
 	github.com/praetordev/render v0.1.0
 	github.com/praetordev/runtoken v0.1.0
-	github.com/praetordev/store v0.1.1
+	github.com/praetordev/store v0.1.2
 	github.com/prometheus/client_golang v1.23.2
 )
 
