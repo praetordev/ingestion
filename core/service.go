@@ -8,6 +8,9 @@ import (
 	"fmt"
 	"github.com/praetordev/plog"
 	"io"
+	"slices"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -30,6 +33,22 @@ type IngestionService struct {
 	DB        *sqlx.DB
 	Publisher EventPublisher
 	Store     objectstore.LogStore
+}
+
+type InventorySyncContext struct {
+	InventoryID  int64
+	UnifiedJobID int64
+	RunID        uuid.UUID
+}
+
+type InventorySyncDelta struct {
+	HostsAdded      int `json:"hosts_added"`
+	HostsUpdated    int `json:"hosts_updated"`
+	HostsDisabled   int `json:"hosts_disabled"`
+	HostsUnchanged  int `json:"hosts_unchanged"`
+	GroupsAdded     int `json:"groups_added"`
+	GroupsUpdated   int `json:"groups_updated"`
+	GroupsUnchanged int `json:"groups_unchanged"`
 }
 
 func NewIngestionService(db *sqlx.DB, pub EventPublisher, store objectstore.LogStore) *IngestionService {
@@ -154,59 +173,223 @@ func (s *IngestionService) StoreFacts(ctx context.Context, runID uuid.UUID, fact
 // groups, and memberships into the given inventory (idempotent, so re-syncing
 // updates in place). Host names that already exist keep their id; new ones are
 // inserted. Variables come from _meta.hostvars.
-func (s *IngestionService) UpsertInventory(ctx context.Context, inventoryID int64, data []byte) error {
+func (s *IngestionService) UpsertInventory(ctx context.Context, syncCtx InventorySyncContext, data []byte) error {
 	hostvars, allHosts, groups, err := decodeInventorySync(data)
 	if err != nil {
+		s.failInventorySync(ctx, syncCtx, "parsing", "invalid_inventory_payload", err)
 		return err
 	}
+	if err := validateInventorySync(allHosts, groups); err != nil {
+		s.failInventorySync(ctx, syncCtx, "validation", "invalid_inventory_model", err)
+		return err
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE inventory_sync_history SET phase='reconciliation', status='running', execution_run_id=$2, started_at=COALESCE(started_at,now()), modified_at=now() WHERE unified_job_id=$1 AND inventory_id=$3`, syncCtx.UnifiedJobID, syncCtx.RunID, syncCtx.InventoryID); err != nil {
+		return fmt.Errorf("start sync history: %w", err)
+	}
 
+	tx, err := s.DB.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin inventory reconciliation: %w", err)
+	}
+	defer tx.Rollback()
+	delta, err := reconcileInventory(ctx, tx, syncCtx.InventoryID, syncCtx.UnifiedJobID, hostvars, allHosts, groups)
+	if err != nil {
+		// Release the history row lock before recording the durable failure in a
+		// separate transaction; otherwise this connection waits on its own tx.
+		_ = tx.Rollback()
+		s.failInventorySync(ctx, syncCtx, "reconciliation", "reconciliation_failed", err)
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE inventory_sync_history SET phase='completed', status='successful', execution_run_id=$2,
+		 hosts_added=$3, hosts_updated=$4, hosts_disabled=$5, hosts_unchanged=$6,
+		 groups_added=$7, groups_updated=$8, groups_unchanged=$9,
+		 diagnostic_code=NULL, diagnostic_message=NULL, diagnostic_details='{}'::jsonb,
+		 finished_at=now(), modified_at=now()
+		 WHERE unified_job_id=$1`, syncCtx.UnifiedJobID, syncCtx.RunID,
+		delta.HostsAdded, delta.HostsUpdated, delta.HostsDisabled, delta.HostsUnchanged,
+		delta.GroupsAdded, delta.GroupsUpdated, delta.GroupsUnchanged); err != nil {
+		return fmt.Errorf("complete sync history: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE inventory_sources SET last_synced_at=now() WHERE id=(SELECT inventory_source_id FROM inventory_sync_history WHERE unified_job_id=$1)`, syncCtx.UnifiedJobID); err != nil {
+		return fmt.Errorf("mark inventory source synced: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit inventory reconciliation: %w", err)
+	}
+	logger.Info("inventory synced", "inventory_id", syncCtx.InventoryID, "delta", delta)
+	return nil
+}
+
+func validateInventorySync(hosts map[string]bool, groups map[string][]string) error {
+	for host := range hosts {
+		if strings.TrimSpace(host) == "" || strings.ContainsAny(host, "\x00\r\n") {
+			return fmt.Errorf("inventory contains an invalid host name")
+		}
+	}
+	for group, members := range groups {
+		if strings.TrimSpace(group) == "" || strings.ContainsAny(group, "\x00\r\n") {
+			return fmt.Errorf("inventory contains an invalid group name")
+		}
+		for _, host := range members {
+			if !hosts[host] {
+				return fmt.Errorf("group %q references unknown host %q", group, host)
+			}
+		}
+	}
+	return nil
+}
+
+type existingHost struct {
+	ID        int64           `db:"id"`
+	Name      string          `db:"name"`
+	Variables json.RawMessage `db:"variables"`
+	Enabled   bool            `db:"enabled"`
+}
+
+func canonicalJSON(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return "{}"
+	}
+	var value any
+	if json.Unmarshal(raw, &value) != nil {
+		return string(raw)
+	}
+	encoded, _ := json.Marshal(value)
+	return string(encoded)
+}
+
+func classifyPresentHost(old existingHost, found bool, vars json.RawMessage) string {
+	if !found {
+		return "added"
+	}
+	if canonicalJSON(old.Variables) == canonicalJSON(vars) && old.Enabled {
+		return "unchanged"
+	}
+	return "updated"
+}
+
+func shouldDisableMissingHost(policy string, old existingHost, present bool) bool {
+	return policy == "disable_missing" && !present && old.Enabled
+}
+
+func reconcileInventory(ctx context.Context, tx *sqlx.Tx, inventoryID, unifiedJobID int64, hostvars map[string]json.RawMessage, allHosts map[string]bool, groups map[string][]string) (InventorySyncDelta, error) {
+	var delta InventorySyncDelta
+	var source struct {
+		ID     int64  `db:"id"`
+		Policy string `db:"reconciliation_policy"`
+	}
+	if err := tx.GetContext(ctx, &source, `SELECT inventory_source_id AS id, reconciliation_policy FROM inventory_sync_history WHERE unified_job_id=$1 AND inventory_id=$2 FOR UPDATE`, unifiedJobID, inventoryID); err != nil {
+		return delta, fmt.Errorf("resolve sync source: %w", err)
+	}
+	existing := []existingHost{}
+	if err := tx.SelectContext(ctx, &existing, `SELECT id,name,variables,enabled FROM hosts WHERE inventory_id=$1 AND inventory_source_id=$2 FOR UPDATE`, inventoryID, source.ID); err != nil {
+		return delta, fmt.Errorf("lock existing hosts: %w", err)
+	}
+	byName := make(map[string]existingHost, len(existing))
+	for _, host := range existing {
+		byName[host.Name] = host
+	}
 	hostID := map[string]int64{}
-	for h := range allHosts {
-		vars := hostvars[h]
+	for name := range allHosts {
+		vars := hostvars[name]
 		if len(vars) == 0 {
 			vars = json.RawMessage("{}")
 		}
-		var id int64
-		if err := s.DB.GetContext(ctx, &id, `SELECT id FROM hosts WHERE inventory_id=$1 AND name=$2`, inventoryID, h); err != nil {
-			if ierr := s.DB.QueryRowContext(ctx,
-				`INSERT INTO hosts (inventory_id, name, variables) VALUES ($1, $2, $3::jsonb) RETURNING id`,
-				inventoryID, h, []byte(vars)).Scan(&id); ierr != nil {
-				logger.Error("sync insert host failed", "host", h, "err", ierr)
+		old, found := byName[name]
+		mutation := classifyPresentHost(old, found, vars)
+		if mutation == "added" {
+			var id int64
+			if err := tx.QueryRowContext(ctx, `INSERT INTO hosts (inventory_id,inventory_source_id,name,variables,enabled) VALUES ($1,$2,$3,$4::jsonb,true) RETURNING id`, inventoryID, source.ID, name, []byte(vars)).Scan(&id); err != nil {
+				return delta, fmt.Errorf("insert host %q: %w", name, err)
+			}
+			hostID[name] = id
+			delta.HostsAdded++
+			continue
+		}
+		hostID[name] = old.ID
+		if mutation == "unchanged" {
+			delta.HostsUnchanged++
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE hosts SET variables=$2::jsonb,enabled=true,modified_at=now() WHERE id=$1`, old.ID, []byte(vars)); err != nil {
+			return delta, fmt.Errorf("update host %q: %w", name, err)
+		}
+		delta.HostsUpdated++
+	}
+	if source.Policy == "disable_missing" {
+		for _, old := range existing {
+			if !shouldDisableMissingHost(source.Policy, old, allHosts[old.Name]) {
 				continue
 			}
-		} else {
-			if _, err := s.DB.ExecContext(ctx, `UPDATE hosts SET variables=$2::jsonb, modified_at=now() WHERE id=$1`, id, []byte(vars)); err != nil {
-				logger.Error("sync update host vars failed", "host", h, "err", err)
+			if _, err := tx.ExecContext(ctx, `UPDATE hosts SET enabled=false,modified_at=now() WHERE id=$1`, old.ID); err != nil {
+				return delta, fmt.Errorf("disable missing host %q: %w", old.Name, err)
 			}
+			delta.HostsDisabled++
 		}
-		hostID[h] = id
 	}
 
-	for gname, hosts := range groups {
+	for name, members := range groups {
 		var gid int64
-		if err := s.DB.GetContext(ctx, &gid, `SELECT id FROM groups WHERE inventory_id=$1 AND name=$2`, inventoryID, gname); err != nil {
-			if ierr := s.DB.QueryRowContext(ctx,
-				`INSERT INTO groups (inventory_id, name, created_at, modified_at) VALUES ($1, $2, now(), now()) RETURNING id`,
-				inventoryID, gname).Scan(&gid); ierr != nil {
-				logger.Error("sync insert group failed", "group", gname, "err", ierr)
-				continue
+		var existed bool
+		err := tx.QueryRowContext(ctx, `SELECT id,true FROM groups WHERE inventory_id=$1 AND inventory_source_id=$2 AND name=$3 FOR UPDATE`, inventoryID, source.ID, name).Scan(&gid, &existed)
+		if errors.Is(err, sql.ErrNoRows) {
+			if err := tx.QueryRowContext(ctx, `INSERT INTO groups (inventory_id,inventory_source_id,name) VALUES ($1,$2,$3) RETURNING id`, inventoryID, source.ID, name).Scan(&gid); err != nil {
+				return delta, fmt.Errorf("insert group %q: %w", name, err)
+			}
+			delta.GroupsAdded++
+		} else if err != nil {
+			return delta, fmt.Errorf("find group %q: %w", name, err)
+		}
+		var prior []int64
+		if err := tx.SelectContext(ctx, &prior, `SELECT host_id FROM host_groups WHERE group_id=$1 ORDER BY host_id`, gid); err != nil {
+			return delta, fmt.Errorf("read group %q membership: %w", name, err)
+		}
+		wanted := make([]int64, 0, len(members))
+		for _, host := range members {
+			wanted = append(wanted, hostID[host])
+		}
+		sort.Slice(wanted, func(i, j int) bool { return wanted[i] < wanted[j] })
+		if existed && slices.Equal(prior, wanted) {
+			delta.GroupsUnchanged++
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM host_groups WHERE group_id=$1`, gid); err != nil {
+			return delta, fmt.Errorf("reset group %q membership: %w", name, err)
+		}
+		for _, id := range wanted {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO host_groups (host_id,group_id) VALUES ($1,$2)`, id, gid); err != nil {
+				return delta, fmt.Errorf("link group %q: %w", name, err)
 			}
 		}
-		for _, h := range hosts {
-			if hid, ok := hostID[h]; ok {
-				if _, err := s.DB.ExecContext(ctx,
-					`INSERT INTO host_groups (host_id, group_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, hid, gid); err != nil {
-					logger.Error("sync link host to group failed", "host", h, "group", gname, "err", err)
-				}
-			}
+		if existed {
+			delta.GroupsUpdated++
 		}
 	}
+	return delta, nil
+}
 
-	if _, err := s.DB.ExecContext(ctx, `UPDATE inventory_sources SET last_synced_at=now() WHERE inventory_id=$1`, inventoryID); err != nil {
-		logger.Error("sync mark inventory synced failed", "inventory_id", inventoryID, "err", err)
+func (s *IngestionService) failInventorySync(ctx context.Context, syncCtx InventorySyncContext, phase, code string, cause error) {
+	message := cause.Error()
+	if len(message) > 2000 {
+		message = message[:2000]
 	}
-	logger.Info("inventory synced", "inventory_id", inventoryID, "hosts", len(hostID), "groups", len(groups))
-	return nil
+	if _, err := s.DB.ExecContext(ctx, `UPDATE inventory_sync_history SET phase=$2,status='failed',execution_run_id=$3,diagnostic_code=$4,diagnostic_message=$5,diagnostic_details='{}'::jsonb,started_at=COALESCE(started_at,now()),finished_at=now(),modified_at=now() WHERE unified_job_id=$1 AND inventory_id=$6`, syncCtx.UnifiedJobID, phase, syncCtx.RunID, code, message, syncCtx.InventoryID); err != nil {
+		logger.Error("record inventory sync failure", "job_id", syncCtx.UnifiedJobID, "err", err)
+	}
+}
+
+// RecordInventorySyncFailure persists a bounded executor-side acquisition
+// failure. Callers provide a safe summary only; raw provider output and resolved
+// credential material must never cross this boundary.
+func (s *IngestionService) RecordInventorySyncFailure(ctx context.Context, syncCtx InventorySyncContext, phase, code, message string) {
+	if phase != "acquisition" && phase != "validation" {
+		phase = "acquisition"
+	}
+	if strings.TrimSpace(code) == "" {
+		code = "inventory_sync_failed"
+	}
+	s.failInventorySync(ctx, syncCtx, phase, code, errors.New(message))
 }
 
 func decodeInventorySync(data []byte) (map[string]json.RawMessage, map[string]bool, map[string][]string, error) {
