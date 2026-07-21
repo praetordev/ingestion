@@ -39,6 +39,14 @@ type FactCacheUpload struct {
 	Facts map[string]json.RawMessage `json:"facts"`
 }
 
+type InventorySyncFailureRequest struct {
+	UnifiedJobID int64     `json:"unified_job_id"`
+	RunID        uuid.UUID `json:"execution_run_id"`
+	Phase        string    `json:"phase"`
+	Code         string    `json:"code"`
+	Message      string    `json:"message"`
+}
+
 func (e JobEventRequest) event() events.JobEvent {
 	return events.JobEvent{
 		ExecutionRunID: e.ExecutionRunID,
@@ -263,15 +271,46 @@ func (h *IngestionHandler) IngestInventorySync(w http.ResponseWriter, r *http.Re
 		praetorRender.ErrInvalidRequest(err).Render(w, r)
 		return
 	}
+	jobID, err := strconv.ParseInt(r.Header.Get("X-Praetor-Unified-Job-ID"), 10, 64)
+	if err != nil || jobID <= 0 {
+		praetorRender.ErrInvalidRequest(fmt.Errorf("X-Praetor-Unified-Job-ID is required")).Render(w, r)
+		return
+	}
+	runID, err := uuid.Parse(r.Header.Get("X-Praetor-Execution-Run-ID"))
+	if err != nil {
+		praetorRender.ErrInvalidRequest(fmt.Errorf("X-Praetor-Execution-Run-ID is required")).Render(w, r)
+		return
+	}
 	data, err := io.ReadAll(io.LimitReader(r.Body, 32<<20)) // cap 32MB
 	if err != nil {
 		praetorRender.ErrInvalidRequest(err).Render(w, r)
 		return
 	}
-	if err := h.Service.UpsertInventory(r.Context(), invID, data); err != nil {
+	if err := h.Service.UpsertInventory(r.Context(), core.InventorySyncContext{InventoryID: invID, UnifiedJobID: jobID, RunID: runID}, data); err != nil {
 		praetorRender.ErrInternal(err).Render(w, r)
 		return
 	}
+	render.Status(r, http.StatusAccepted)
+	render.JSON(w, r, map[string]string{"status": "accepted"})
+}
+
+// IngestInventorySyncFailure records acquisition failures that happen before
+// the executor has a payload to submit to the transactional sync-data endpoint.
+func (h *IngestionHandler) IngestInventorySyncFailure(w http.ResponseWriter, r *http.Request) {
+	invID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		praetorRender.ErrInvalidRequest(err).Render(w, r)
+		return
+	}
+	var body InventorySyncFailureRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 16<<10)).Decode(&body); err != nil || body.UnifiedJobID <= 0 || body.RunID == uuid.Nil {
+		praetorRender.ErrInvalidRequest(fmt.Errorf("valid job and run identifiers are required")).Render(w, r)
+		return
+	}
+	if len(body.Message) > 2000 {
+		body.Message = body.Message[:2000]
+	}
+	h.Service.RecordInventorySyncFailure(r.Context(), core.InventorySyncContext{InventoryID: invID, UnifiedJobID: body.UnifiedJobID, RunID: body.RunID}, body.Phase, body.Code, body.Message)
 	render.Status(r, http.StatusAccepted)
 	render.JSON(w, r, map[string]string{"status": "accepted"})
 }
